@@ -1,0 +1,200 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. CONFIGURATION & HYPERPARAMETERS
+# ==========================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 4
+SEQUENCE_LENGTH = 10  # Number of frames grouped per spatio-temporal volume
+IMAGE_SIZE = 224      # Target spatial width/height
+LEARNING_RATE = 1e-4
+EPOCHS = 5
+
+# ==========================================
+# 2. DATA UTILITIES & CUSTOM DATASET
+# ==========================================
+class SurveillanceVideoDataset(Dataset):
+    """
+    Loads raw video streams, extracts consecutive frame sequences,
+    and reshapes them into temporal volumes (C, T, H, W) for spatio-temporal models.
+    """
+    def __init__(self, video_path, seq_length=SEQUENCE_LENGTH, img_size=IMAGE_SIZE):
+        self.video_path = video_path
+        self.seq_length = seq_length
+        self.img_size = img_size
+        self.frames = self._load_and_preprocess_video()
+
+    def _load_and_preprocess_video(self):
+        cap = cv2.VideoCapture(self.video_path)
+        frames = []
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # Convert to Grayscale or keep RGB. Standard Spatio-Temporal architectures use Grayscale to focus on motion shapes
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = cv2.resize(frame, (self.img_size, self.img_size))
+            # Normalize to [0, 1]
+            frame = frame.astype(np.float32) / 255.0
+            frames.append(frame)
+        cap.release()
+        return np.array(frames)
+
+    def __len__(self):
+        # Sliding window sequence length verification
+        if len(self.frames) < self.seq_length:
+            return 0
+        return len(self.frames) - self.seq_length + 1
+
+    def __getitem__(self, idx):
+        # Extract a temporal block of sequence frames
+        seq = self.frames[idx : idx + self.seq_length]
+        # Reshape into channel-first spatio-temporal tensor: (Channels, Temporal, Height, Width)
+        # Channels = 1 for grayscale
+        seq = np.expand_dims(seq, axis=0) 
+        return torch.tensor(seq, dtype=torch.float32)
+
+# ==========================================
+# 3. SPATIO-TEMPORAL CONVOLUTIONAL AUTOENCODER
+# ==========================================
+class SpatioTemporalAutoencoder(nn.Module):
+    """
+    3D Convolutional Autoencoder designed to capture concurrent
+    spatial features and temporal sequence attributes in surveillance footage.
+    """
+    def __init__(self):
+        super(SpatioTemporalAutoencoder, self).__init__()
+        
+        # Encoder Pipeline
+        self.encoder = nn.Sequential(
+            # Input: (1, 10, 224, 224) -> Output: (16, 10, 112, 112)
+            nn.Conv3d(1, 16, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(16),
+            nn.Tanh(),
+            # Input: (16, 10, 112, 112) -> Output: (32, 5, 56, 56)
+            nn.Conv3d(16, 32, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(32),
+            nn.Tanh(),
+        )
+        
+        # Decoder Pipeline (Transposed 3D Convolutions reconstructing original inputs)
+        self.decoder = nn.Sequential(
+            # Input: (32, 5, 56, 56) -> Output: (16, 10, 112, 112)
+            nn.ConvTranspose3d(32, 16, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1), output_padding=(1, 1, 1)),
+            nn.BatchNorm3d(16),
+            nn.Tanh(),
+            # Input: (16, 10, 112, 112) -> Output: (1, 10, 224, 224)
+            nn.ConvTranspose3d(16, 1, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1), output_padding=(0, 1, 1)),
+            nn.Sigmoid() # Keeps reconstructed pixels bounded cleanly inside [0, 1]
+        )
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        reconstructed = self.decoder(latent)
+        return reconstructed
+
+# ==========================================
+# 4. TRAINING ROUTINE
+# ==========================================
+def train_model(video_file_path):
+    print(f"Initializing Dataset pipeline using: {video_file_path}")
+    dataset = SurveillanceVideoDataset(video_file_path)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+    
+    model = SpatioTemporalAutoencoder().to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    print("Beginning Training Iterations on Normal Behavior Framework...")
+    model.train()
+    for epoch in range(1, EPOCHS + 1):
+        epoch_loss = 0.0
+        for batch_idx, batch_data in enumerate(dataloader):
+            batch_data = batch_data.to(DEVICE)
+            
+            optimizer.zero_grad()
+            outputs = model(batch_data)
+            loss = criterion(outputs, batch_data)
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item() * batch_data.size(0)
+            
+        avg_loss = epoch_loss / len(dataset)
+        print(f"Epoch [{epoch}/{EPOCHS}] ----- Average Loss: {avg_loss:.6f}")
+        
+    # Save optimized model parameters
+    torch.save(model.state_dict(), "anomaly_autoencoder.pth")
+    print("Model structural weights exported cleanly as 'anomaly_autoencoder.pth'")
+    return model
+
+# ==========================================
+# 5. ANOMALY DETECTION ENGINE & EVALUATION
+# ==========================================
+def evaluate_anomaly_metrics(model, test_video_path):
+    model.eval()
+    dataset = SurveillanceVideoDataset(test_video_path)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+    
+    reconstruction_errors = []
+    
+    print("\nCalculating frame-wise reconstruction error distributions...")
+    with torch.no_grad():
+        for batch_data in dataloader:
+            batch_data = batch_data.to(DEVICE)
+            outputs = model(batch_data)
+            
+            # Compute Euclidean error map dynamically across the entire frame sequence
+            error = torch.mean((batch_data - outputs) ** 2).item()
+            reconstruction_errors.append(error)
+            
+    # Compute Regularity Scores: S(t) = 1 - (e(t) - min(e)) / max(e)
+    errors_np = np.array(reconstruction_errors)
+    min_err, max_err = errors_np.min(), errors_np.max()
+    
+    # Avoid zero division errors
+    if max_err == min_err:
+        regularity_scores = np.ones_like(errors_np)
+    else:
+        regularity_scores = 1.0 - ((errors_np - min_err) / (max_err - min_err))
+        
+    # Generate visual diagnostics plot
+    plt.figure(figsize=(10, 5))
+    plt.plot(regularity_scores, label="Regularity Score $S(t)$", color='blue', linewidth=2)
+    plt.axhline(y=0.4, color='red', linestyle='--', label='Anomaly Detection Threshold')
+    plt.title("Video Anomaly Assessment Profile Curve")
+    plt.xlabel("Temporal Sequence Block Index")
+    plt.ylabel("Regularity Scale Value")
+    plt.legend(loc="lower left")
+    plt.grid(True)
+    plt.savefig("anomaly_evaluation_plot.png")
+    print("Evaluation tracking matrix exported visually to 'anomaly_evaluation_plot.png'")
+    plt.show()
+
+# ==========================================
+# 6. PIPELINE EXECUTION ENTRYPOINT
+# ==========================================
+if __name__ == "__main__":
+    # Create a mock placeholder configuration video file if it does not exist
+    dummy_video_path = "sample_surveillance.mp4"
+    if not os.path.exists(dummy_video_path):
+        print(f"Generating synthetic mock structure asset for test execution: '{dummy_video_path}'...")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(dummy_video_path, fourcc, 20.0, (640, 480), isColor=True)
+        # Write 100 random frames to mimic footage structure data matrix
+        for _ in range(100):
+            frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            out.write(frame)
+        out.release()
+
+    # Execute training routine
+    trained_net = train_model(dummy_video_path)
+    
+    # Run structural assessment mapping logic
+    evaluate_anomaly_metrics(trained_net, dummy_video_path)
